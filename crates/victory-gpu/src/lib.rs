@@ -50,6 +50,8 @@ pub mod framelog;
 #[cfg(windows)]
 mod heap_worker;
 #[cfg(windows)]
+mod compose;
+#[cfg(windows)]
 mod host;
 #[cfg(windows)]
 mod indirect;
