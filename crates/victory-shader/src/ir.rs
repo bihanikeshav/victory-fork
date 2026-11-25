@@ -796,6 +796,17 @@ fn rename(mut blocks: Vec<Block>, wave64: bool, vgprs: u16) -> Program {
             .map(|reg| (reg, current[index(reg)]))
             .collect();
     }
+    let mut blocks = blocks;
+    let mut reachable = vec![false; blocks.len()];
+    for &b in &order {
+        reachable[b] = true;
+    }
+    for (b, block) in blocks.iter_mut().enumerate() {
+        if !reachable[b] {
+            block.phis.clear();
+            block.insts.clear();
+        }
+    }
     for block in &mut blocks {
         for phi in &mut block.phis {
             phi.args = block
@@ -1174,12 +1185,22 @@ pub(crate) fn reverse_postorder(blocks: &[Block]) -> Vec<usize> {
     post
 }
 
-/// Recomputes every block's predecessors from the exits.
+/// Recomputes every block's predecessors from the reachable exits.
 fn link(blocks: &mut [Block]) {
     for block in blocks.iter_mut() {
         block.preds.clear();
     }
+    if blocks.is_empty() {
+        return;
+    }
+    let mut reachable = vec![false; blocks.len()];
+    for b in reverse_postorder(blocks) {
+        reachable[b] = true;
+    }
     for b in 0..blocks.len() {
+        if !reachable[b] {
+            continue;
+        }
         for s in blocks[b].exit.successors() {
             blocks[s].preds.push(b);
         }
