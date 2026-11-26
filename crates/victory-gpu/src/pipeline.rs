@@ -1004,9 +1004,6 @@ pub fn wanted_early(key: &str) -> bool {
     library::wanted_early(key)
 }
 
-#[cfg(all(test, windows))]
-mod rejected_bind_tests;
-
 #[cfg(test)]
 mod tests {
     #[cfg(all(windows, feature = "diagnostics"))]
