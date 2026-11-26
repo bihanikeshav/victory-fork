@@ -905,3 +905,105 @@ fn a_parked_pair_another_save_or_restore_shares_stays_two_scalars() {
         assert!(!instructions(&p, "s_mov_b32").is_empty(), "{name}");
     }
 }
+
+/// Fork issue #1356: the alpha cascade-shadow program
+/// (`CS_ShadowRenderTiledCascadesAlphaCBPPPC`, 0x294a4-0x29584) counts the lanes of `vcc`
+/// (`s_bcnt1_i32_b64`, skipped past when none), elects the wave's first active lane
+/// (`s_ff1_i32_b64 exec`, `v_mbcnt_lo/hi`, `v_cmpx_eq_i32`, skipped past when not
+/// elected), and that one lane sets bit 14 of a flag word (load, `v_readfirstlane_b32`,
+/// `s_bitset1_b32`, store). Translated for 32-lane waves in the form the program takes
+/// (`ir::without_skips(_, true)`: "without skips, scalars followed"), the word must end
+/// 0x4000 when an active lane has `vcc` and 0 when none has, wherever the first active lane
+/// is: in the lower host wave, or in the upper one with the lower one left with no lane.
+#[test]
+fn the_elected_lane_sets_its_flag_once_wherever_it_is() {
+    const LOAD_V4: [u32; 2] = [0x38 << 26 | 0x0C << 18, 0x80 << 24 | 2 << 16 | 4 << 8]; // buffer_load_dword v4, off, s[8:11], 0
+    const STORE_V4: [u32; 2] = [0x38 << 26 | 0x1C << 18, 0x80 << 24 | 2 << 16 | 4 << 8]; // buffer_store_dword v4, off, s[8:11], 0
+    let mut words = vec![
+        0x7DA6_0001, // v_cmpx_le_u32 exec, s1, v0: lanes s1.. are active
+        0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0: vcc in the active lanes below s0
+        0xBE86_106A, // s_bcnt1_i32_b64 s6, vcc (SCC: some lane)
+        0xBF84_0011, // s_cbranch_scc0 to the end (17 dwords on)
+        0xD765_0001,
+        0x0001_00C1, // v_mbcnt_lo_u32_b32 v1, -1, 0
+        0xD766_0001,
+        0x0002_02C1, // v_mbcnt_hi_u32_b32 v1, -1, v1
+        0xBE8E_147E, // s_ff1_i32_b64 s14, exec
+        0xBE98_047E, // s_mov_b64 s[24:25], exec
+        0x7D24_020E, // v_cmpx_eq_i32 exec, s14, v1: only the first active lane
+        0xBF88_0008, // s_cbranch_execz to the restore (8 dwords on)
+    ];
+    words.extend_from_slice(&LOAD_V4);
+    words.extend_from_slice(&[
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0x7E20_0504, // v_readfirstlane_b32 s16, v4
+        0xBE90_1D8E, // s_bitset1_b32 s16, 14
+        0x7E08_0210, // v_mov_b32 v4, s16
+    ]);
+    words.extend_from_slice(&STORE_V4);
+    words.push(0xBEFE_0418); // s_mov_b64 exec, s[24:25]
+    let native = native(&words);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let deep = ir::without_skips(&p, true);
+    // (s0 = vcc below, s1 = first active lane; the word the program leaves)
+    let cases: [(u32, u32, u32); 6] = [
+        (64, 0, 0x4000),  // elected lane 0, the lower host wave
+        (64, 40, 0x4000), // elected lane 40: the lower host wave has no lane
+        (50, 10, 0x4000), // vcc across both halves, elected lane 10
+        (34, 33, 0x4000), // elected lane 33, one vcc lane
+        (10, 40, 0),      // no active lane has vcc: nothing is written
+        (0, 0, 0),        // every lane active, none with vcc
+    ];
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return;
+    };
+    let mut failed = Vec::new();
+    for (form, prog) in [("plain", Some(&p)), ("without skips, scalars followed", deep.as_ref())] {
+        let Some(prog) = prog else {
+            eprintln!("{form}: the form does not apply");
+            continue;
+        };
+        let shader = match lowered_on(&native, prog, &HashSet::new(), 32) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("{form}: does not translate for 32-lane waves: {e}");
+                continue;
+            }
+        };
+        let (root, pso) = match host.compute_pipeline(&shader) {
+            Ok(x) => x,
+            Err(e) => {
+                eprintln!("{form}: the hardware device refuses it: {e}");
+                continue;
+            }
+        };
+        for &(below, first, want) in &cases {
+            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            for u in &shader.user_data {
+                if u.root == RootType::Constants && u.slot == 0 {
+                    ud[u.index as usize] = [below, first, 0, 0][u.dword as usize];
+                }
+            }
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views: &[View::RawUav(1)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{form}: dispatch failed: {e}"));
+            let got = out[0][0];
+            eprintln!("{form}: vcc below {below}, first active {first}: {got:#x} (want {want:#x})");
+            if got != want {
+                failed.push(format!("{form}: vcc below {below}, first active {first}: {got:#x}, want {want:#x}"));
+            }
+        }
+    }
+    assert!(failed.is_empty(), "{failed:#?}");
+}
