@@ -391,6 +391,34 @@ impl Module {
         self.blocks.len() - 1
     }
 
+    /// Splits `at` at its head: what it holds so far (phis and body) moves to a new block,
+    /// which every branch to `at` now goes to; `at` keeps its terminator (and so stays the
+    /// predecessor its successors' phis name) and goes on empty. The new block, unterminated.
+    pub fn split_head(&mut self, at: usize) -> usize {
+        let head = self.new_block();
+        self.blocks[head].phis = std::mem::take(&mut self.blocks[at].phis);
+        self.blocks[head].body = std::mem::take(&mut self.blocks[at].body);
+        let to = |b: &mut usize| {
+            if *b == at {
+                *b = head;
+            }
+        };
+        for (n, block) in self.blocks.iter_mut().enumerate() {
+            if n == head {
+                continue;
+            }
+            match &mut block.term {
+                Some(Term::Br(t)) => to(t),
+                Some(Term::CondBr(_, t, f)) => {
+                    to(t);
+                    to(f);
+                }
+                _ => {}
+            }
+        }
+        head
+    }
+
     pub fn type_of(&self, v: V) -> Ty {
         match v {
             V::Global(i) => self.globals[i as usize].ptr,

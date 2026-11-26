@@ -1379,3 +1379,61 @@ fn a_wave_wide_loop_in_a_group_of_two_console_waves_sums_its_lane_reads() {
         .collect();
     assert!(wrong.is_empty(), "{} threads wrong, first: {:?}", wrong.len(), wrong.first());
 }
+
+/// What a meeting of the two host waves of a console wave costs on this GPU: 128 threads loop
+/// s0 times reading lane 40 (a meeting a pass, two without banks), timed against the same with s0 = 1.
+/// `cargo test ... meeting_cost -- --ignored --nocapture`.
+#[test]
+#[ignore = "a measurement, not a check"]
+fn meeting_cost() {
+    let words = [
+        0xBE87_0380, // s_mov_b32 s7, 0
+        0xBE90_0380, // s_mov_b32 s16, 0
+        // loop:
+        0x8007_8107, // s_add_u32 s7, s7, 1
+        0xD760_0011,
+        0x0001_5100, // v_readlane_b32 s17, v0, 40
+        0x8010_1110, // s_add_u32 s16, s16, s17
+        0xBF0A_0007, // s_cmp_lt_u32 s7, s0
+        0xBF85_FFFA, // s_cbranch_scc1 loop
+        0x3402_0083, // v_lshlrev_b32 v1, 3, v0
+        0x7E04_0207, // v_mov_b32 v2, s7
+        0x7E06_0210, // v_mov_b32 v3, s16
+        0x38 << 26 | 0x1D << 18 | 1 << 12,
+        0x80 << 24 | 2 << 16 | 2 << 8 | 1, // buffer_store_dwordx2 v[2:3], v1, s[8:11], 0 offen
+    ];
+    let native = native_of(&words, true, 128);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let shader = lowered(&native, &p, &HashSet::new()).expect("lower");
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        return;
+    };
+    let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
+    let time = |passes: u32| {
+        let t = std::time::Instant::now();
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(vec![passes, 0, 0, 0]))],
+                    views: &[View::RawUav(256)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .expect("dispatch");
+        let bad: Vec<(usize, u32, u32)> = (0..128)
+            .filter(|&t| (out[0][2 * t], out[0][2 * t + 1]) != (passes, passes * (t as u32 / 64 * 64 + 40)))
+            .map(|t| (t, out[0][2 * t], out[0][2 * t + 1]))
+            .collect();
+        assert!(bad.is_empty(), "{passes} passes: {} threads wrong, e.g. {:?}", bad.len(), &bad[..bad.len().min(6)]);
+        t.elapsed().as_secs_f64() * 1e6
+    };
+    time(1);
+    let base = (0..3).map(|_| time(1)).fold(f64::MAX, f64::min);
+    let n = 4_000;
+    let long = (0..3).map(|_| time(n)).fold(f64::MAX, f64::min);
+    eprintln!("{n} passes: {:.0} us over the empty dispatch, {:.3} us a pass (one lane read: one meeting with banks, two without)", long - base, (long - base) / f64::from(n));
+}
