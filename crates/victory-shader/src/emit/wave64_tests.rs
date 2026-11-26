@@ -38,6 +38,21 @@ fn program(skip: u32) -> NativeProgram {
     native(&words)
 }
 
+/// Sets `VICTORY_PAIR_SYNC` for the test's thread while it lives.
+struct PairSync(Option<bool>);
+
+impl PairSync {
+    fn on(on: bool) -> PairSync {
+        PairSync(lower::TEST_PAIR_SYNC.replace(Some(on)))
+    }
+}
+
+impl Drop for PairSync {
+    fn drop(&mut self) {
+        lower::TEST_PAIR_SYNC.set(self.0);
+    }
+}
+
 /// A wave64 compute program of 64 threads (one console wave; the thread index in v0) with 4
 /// root constants in s0..s3 and a raw UAV's descriptor in s[8:11], then `body`.
 fn native(body: &[u32]) -> NativeProgram {
@@ -1010,6 +1025,7 @@ fn the_elected_lane_sets_its_flag_once_wherever_it_is() {
 
 #[test]
 fn multi_wave_widen_runs_inside_a_divergent_scalar_branch() {
+    let _pairs = PairSync::on(true);
     // Divergent scalar branch (`s_bcnt1` on `vcc` -> `s_cbranch_scc0`) enclosing a widened
     // `s_cbranch_execz`: the console waves of the group go different ways at the scalar branch
     // (s0 is then the count of lanes past s0 in this console wave). With pair meetings each
@@ -1365,6 +1381,7 @@ fn a_console_wave_that_skips_a_group_widened_branch_stores_nothing_in_it() {
 /// 40's thread index each time; every thread stores (iterations, sum).
 #[test]
 fn console_waves_of_a_group_loop_different_counts_on_their_own_scalars() {
+    let _pairs = PairSync::on(true);
     let words = [
         0x7E0C_0500, // v_readfirstlane_b32 s6, v0
         0x9006_8606, // s_lshr_b32 s6, s6, 6: the console wave
@@ -1424,6 +1441,7 @@ fn console_waves_of_a_group_loop_different_counts_on_their_own_scalars() {
 /// Lane `t` goes round `(t & 3) + 1` times, adding lane 40's thread index of its console wave.
 #[test]
 fn a_wave_wide_loop_in_a_group_of_two_console_waves_sums_its_lane_reads() {
+    let _pairs = PairSync::on(true);
     let words = [
         0x3606_0083, // v_and_b32 v3, 3, v0
         0x7E02_0280, // v_mov_b32 v1, 0
@@ -1488,6 +1506,7 @@ fn a_wave_wide_loop_in_a_group_of_two_console_waves_sums_its_lane_reads() {
 #[test]
 #[ignore = "a measurement, not a check"]
 fn meeting_cost() {
+    let _pairs = PairSync::on(true);
     let words = [
         0xBE87_0380, // s_mov_b32 s7, 0
         0xBE90_0380, // s_mov_b32 s16, 0
@@ -1538,4 +1557,43 @@ fn meeting_cost() {
     let n = 4_000;
     let long = (0..3).map(|_| time(n)).fold(f64::MAX, f64::min);
     eprintln!("{n} passes: {:.0} us over the empty dispatch, {:.3} us a pass (one lane read: one meeting with banks, two without)", long - base, (long - base) / f64::from(n));
+}
+
+
+/// Without pair meetings (`VICTORY_PAIR_SYNC` unset), a wave-wide branch inside a scalar branch
+/// the console waves of a group take differently is refused, as before: group barriers there
+/// would wait for threads that do not come.
+#[test]
+fn multi_wave_widen_refuses_a_divergent_scalar_branch_without_pair_meetings() {
+    let _pairs = PairSync::on(false);
+    let mut words = vec![
+        0x7D82_0000, // v_cmp_lt_u32 vcc, s0, v0
+        0xBE80_106A, // s_bcnt1_i32_b64 s0, vcc
+        0xBF84_001D, // s_cbranch_scc0 label_end (+29)
+        0x7E0A_0281, // v_mov_b32 v5, 1
+        0x2C0C_0081, // v_lshrrev_b32 v6, 1, v0
+        0x340E_0B06, // v_lshlrev_b32 v7, v6, v5
+        0x7D82_0000, // v_cmp_lt_u32 vcc, s0, v0
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_0017, // s_cbranch_execz +23
+    ];
+    words.extend_from_slice(&super::wave::WAVE_OR_V7_TO_S7);
+    words.extend_from_slice(&[
+        0x7E00_0207, // v_mov_b32 v0, s7
+        0x38 << 26 | 0x1C << 18,
+        0x80 << 24 | 2 << 16,
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+    ]);
+    let native = native_of(&words, true, 128);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let br_block = p
+        .blocks
+        .iter()
+        .position(|b| b.insts.last().is_some_and(|i| i.name() == "s_cbranch_execz"))
+        .expect("branch block");
+    match lowered(&native, &p, &HashSet::from([br_block])) {
+        Ok(_) => panic!("must refuse a wave-wide branch inside a divergent scalar branch"),
+        Err(ShaderError::Unsupported { what, .. }) => assert!(what.contains("divergent scalar branch"), "{what}"),
+        Err(e) => panic!("{e}"),
+    }
 }

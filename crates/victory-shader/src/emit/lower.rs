@@ -797,11 +797,25 @@ pub(super) fn wave_local(p: &Program, st: &Structured) -> Result<(), (usize, &'s
 /// The mode of a group barrier the translation adds (host waves meeting):
 /// a wait for the group with a shared-memory fence; the fence alone with
 /// `VICTORY_GROUP_SYNC=0` ([`super::group_sync`]).
-/// `VICTORY_PAIR_SYNC` (default on; `0` off): in groups of several console waves, the host waves
-/// of one console wave meet by themselves ([`Lower::pair_sync`]) instead of at group barriers.
+/// `VICTORY_PAIR_SYNC=1` (off unless set): in groups of several console waves, the host waves of
+/// one console wave meet by themselves ([`Lower::pair_sync`]) instead of at group barriers, so
+/// programs whose console waves branch or loop apart translate for 32-lane hosts. Off by default:
+/// a meeting costs about as much as a group barrier, but a program the title had refused then
+/// runs, and one of them (vfx_triangleClip:CS_DefragHeap_ComputeRelocations, a serial loop of
+/// lane reads) takes 15 ms of an RTX 5060 Laptop's time a frame.
 fn pair_sync_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_PAIR_SYNC.get() {
+        return on;
+    }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("VICTORY_PAIR_SYNC").map_or(true, |v| v.trim() != "0"))
+    *ON.get_or_init(|| std::env::var("VICTORY_PAIR_SYNC").is_ok_and(|v| v.trim() == "1"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's `VICTORY_PAIR_SYNC`, for its thread only.
+    pub(super) static TEST_PAIR_SYNC: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 fn meeting_mode() -> u32 {
