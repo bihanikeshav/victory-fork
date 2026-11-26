@@ -69,6 +69,51 @@ fn mark_branch_region(succ: &[Vec<usize>], pdom: &[Vec<u64>], d: usize, seen: &m
     }
 }
 
+/// Where the console waves of a multi-wave group take a wave-wide branch apart
+/// ([`Lower::wave_wide`] with `group_wide`): for each IR block, the innermost wave-wide branch
+/// whose region holds it, each such branch's region (the blocks reachable from it that do not
+/// post-dominate it), and per join (the branch's way past its region) the branches it closes.
+/// The group runs a region if any of its console waves takes the branch; a console wave that
+/// does not is kept out of the region's effects and scalars by the branch's `took`.
+pub(super) struct WideRegions {
+    pub(super) innermost: Vec<Option<usize>>,
+    pub(super) region: HashMap<usize, Vec<bool>>,
+    pub(super) joins: HashMap<usize, Vec<usize>>,
+}
+
+/// [`WideRegions`] of `st`'s wave-wide branches; `None` with an indirect exit.
+pub(super) fn wide_regions(st: &Structured) -> Option<WideRegions> {
+    let n = st.exits.len();
+    let succ = exits_succ(st)?;
+    let pdom = postdominators(&succ);
+    let mut region = HashMap::new();
+    let mut joins: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (d, e) in st.exits.iter().enumerate() {
+        let LaneExit::Branch { taken, not_taken, .. } = *e else { continue };
+        if !st.wide.contains(&d) {
+            continue;
+        }
+        let mut seen = vec![false; n];
+        mark_branch_region(&succ, &pdom, d, &mut seen);
+        // (the join: the way that is not in the region, either way round)
+        match (seen[taken], seen[not_taken]) {
+            (true, false) => joins.entry(not_taken).or_default().push(d),
+            (false, true) => joins.entry(taken).or_default().push(d),
+            _ => {}
+        }
+        region.insert(d, seen);
+    }
+    let mut innermost = vec![None; n];
+    for (b, slot) in innermost.iter_mut().enumerate() {
+        *slot = region
+            .iter()
+            .filter(|(_, r)| r[b])
+            .min_by_key(|(_, r)| r.iter().filter(|&&x| x).count())
+            .map(|(&d, _)| d);
+    }
+    Some(WideRegions { innermost, region, joins })
+}
+
 /// Every per-lane branch (by its block) with its region: the blocks reachable from it that do
 /// not post-dominate it, which only some lanes run. Not the branches the wave takes together
 /// ([`Structured::wide`]), nor those on scalar conditions. None with an indirect exit.

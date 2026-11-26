@@ -276,6 +276,10 @@ struct Lower<'a> {
     /// to reduce across every wave of the group, plus per-IR block group convergence (`all_group_blocks`).
     group_wide: Option<(u32, u32)>,
     all_group: Option<Vec<bool>>,
+    /// With `group_wide`: the wave-wide branches' regions ([`group_wide::WideRegions`]), and per
+    /// such branch whether this lane's console wave takes it (`took`, computed at the branch).
+    wide_regions: Option<group_wide::WideRegions>,
+    group_took: HashMap<usize, V>,
     /// With `exchange`: nothing is exchanged, each host wave acts as a wave
     /// of its own ([`with_local_waves`]).
     local: bool,
@@ -1586,6 +1590,8 @@ impl<'a> Lower<'a> {
                 _ => Default::default(),
             },
             exchange,
+            wide_regions: if group_wide.is_some() { group_wide::wide_regions(x.st) } else { None },
+            group_took: HashMap::new(),
             group_wide,
             all_group,
             clane: None,
@@ -2331,6 +2337,7 @@ impl<'a> Lower<'a> {
                 };
                 self.vals.insert(phi.value, val);
             }
+            self.keep_skipped_scalars(b)?;
             if self.lds_meet.as_ref().is_some_and(|(_, meet)| meet[b].0) {
                 self.lds_meeting();
             }
@@ -4040,23 +4047,70 @@ impl<'a> Lower<'a> {
         if let Some(active) = self.partial_active {
             set = self.s.m.bin(c, Bin::And, set, active);
         }
+        // In a group of several console waves the group takes the branch if any of its
+        // console waves does (so that every thread meets every barrier), and a console wave
+        // that does not is kept out of the region by its own `took`. Exact only for a forward
+        // branch into a region that rejoins at its other way (`if (some lane) { ... }`): an
+        // `else` the console waves would split over, a loop, or an all-lanes test stay refused.
         let (i1t, i32t) = (self.s.t.i1, self.s.t.i32);
         let some = self.s.op(c, "waveAnyTrue", Attr::NoUnwind, i1t, 113, &[set]);
         self.s.flags |= flags::WAVE_OPS;
         if let Some((slot, host_waves)) = self.group_wide {
+            // In a group of several console waves the group runs the branch's body if any of
+            // its console waves does (so that every thread meets every barrier), and a console
+            // wave that does not is kept out of the body by its own `took` (effects guarded,
+            // scalars taken back at the join). Exact only for a forward branch around a body
+            // that rejoins at its other way (`if (some lane) { ... }`, either way round); a
+            // loop or an `else` the console waves would split over stays refused.
+            const SHAPE: Why = "a wave-wide branch in a group of several console waves that is not a forward if";
             if !self.all_group(b) {
                 return Err("a wave-wide branch inside a divergent scalar branch");
             }
+            let LaneExit::Branch { taken, not_taken, .. } = self.x.st.exits[b] else {
+                return Err(SHAPE);
+            };
+            let regions = self.wide_regions.as_ref().ok_or(SHAPE)?;
+            let region = regions.region.get(&b).ok_or(SHAPE)?;
+            let body_taken = match (region[taken], region[not_taken]) {
+                (true, false) => true,
+                (false, true) => false,
+                _ => return Err(SHAPE),
+            };
+            let body = if body_taken { taken } else { not_taken };
+            if self.rpo[body] <= self.rpo[b] {
+                return Err(SHAPE);
+            }
+            let outer_took = regions.innermost[b].and_then(|r| self.group_took.get(&r).copied());
+            // This console wave's own decision (both of its halves), then whether it enters
+            // the body; a console wave already kept out of an enclosing body does not.
+            let mine32 = self.s.m.cast(c, Cast::ZExt, some, i32t);
+            let (lo, hi) = self.exchange_halves(c, mine32);
+            let c = self.cur;
+            let both = self.s.m.bin(c, Bin::Or, lo, hi);
+            let z0 = self.s.m.i32(0);
+            // (the console's branch goes to `taken` when `d`)
+            let d = self.s.m.cmp(c, if any { pred::NE } else { pred::EQ }, both, z0);
+            let mut took = if body_taken {
+                d
+            } else {
+                let t = self.s.m.bool(true);
+                self.s.m.bin(c, Bin::Xor, d, t)
+            };
+            if let Some(t) = outer_took {
+                took = self.s.m.bin(c, Bin::And, took, t);
+            }
+            self.group_took.insert(b, took);
+            // Some console wave of the group enters: one dword per host wave in LDS.
             let thread = self.console_thread();
             let c = self.cur;
             let five = self.s.m.i32(5);
             let hw = self.s.m.bin(c, Bin::LShr, thread, five);
-            let some = self.s.m.cast(c, Cast::ZExt, some, i32t);
+            let took32 = self.s.m.cast(c, Cast::ZExt, took, i32t);
             let base = self.s.m.i32(slot);
             let idx = self.s.m.bin(c, Bin::Add, base, hw);
             let lds = self.s.lds();
             let ptr = self.s.m.element(c, lds, idx);
-            self.s.m.store(c, ptr, some);
+            self.s.m.store(c, ptr, took32);
             self.group_sync(c);
             let lane = self.s.op(c, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
             let count = self.s.m.i32(host_waves);
@@ -4067,13 +4121,13 @@ impl<'a> Lower<'a> {
             let rptr = self.s.m.element(c, lds, ridx);
             let val = self.s.m.load(c, rptr);
             let nz = self.s.m.cmp(c, pred::NE, val, z);
-            let all_some = self.s.op(c, "waveAnyTrue", Attr::NoUnwind, i1t, 113, &[nz]);
+            let enter = self.s.op(c, "waveAnyTrue", Attr::NoUnwind, i1t, 113, &[nz]);
             self.group_sync(c);
-            return Ok(if any {
-                all_some
+            return Ok(if body_taken {
+                enter
             } else {
                 let t = self.s.m.bool(true);
-                self.s.m.bin(c, Bin::Xor, all_some, t)
+                self.s.m.bin(c, Bin::Xor, enter, t)
             });
         }
         let some = self.s.m.cast(c, Cast::ZExt, some, i32t);
@@ -4153,11 +4207,61 @@ impl<'a> Lower<'a> {
         inst.write(pick(reg)?)
     }
 
-    fn guard(&mut self, b: usize, i: usize) -> Result<Option<V>, Why> {
-        match self.x.st.guards[b][i] {
-            None => Ok(None),
-            Some(g) => Ok(Some(self.boolean(g, self.cur)?)),
+    /// At the join of group-widened branches ([`Self::wave_wide`] with `group_wide`): a console
+    /// wave that did not take a branch keeps the scalars (and SCC) it had before it, as on the
+    /// console, where it skipped the region; the group ran the region together, so the join's
+    /// phis bring the region's values. Each scalar phi is taken as `took ? joined : before`.
+    fn keep_skipped_scalars(&mut self, b: usize) -> Result<(), Stop> {
+        let p = self.x.p;
+        let Some(branches) = self.wide_regions.as_ref().and_then(|w| w.joins.get(&b)).cloned() else {
+            return Ok(());
+        };
+        for br in branches {
+            let Some(&took) = self.group_took.get(&br) else { continue };
+            let Some(n) = p.blocks[b].preds.iter().position(|&q| q == br) else { continue };
+            for phi in &p.blocks[b].phis {
+                if matches!(phi.reg, Reg::V(_)) || matches!(phi.reg, Reg::S(c) if c == EXEC || c == EXEC + 1) {
+                    continue;
+                }
+                let before = phi.args[n];
+                let (joined, old) = match (self.vals.get(&phi.value).copied(), self.vals.get(&before).copied()) {
+                    (Some(Val::I32(j)), Some(Val::I32(o))) | (Some(Val::Bit(j)), Some(Val::Bit(o))) => (j, o),
+                    (Some(Val::Missing(_)) | None, _) => continue,
+                    _ => {
+                        return Err(unsupported(
+                            p.blocks[b].offset,
+                            "a scalar joined past a group-widened branch with no value before it",
+                        ));
+                    }
+                };
+                let v = self.s.m.select(self.cur, took, joined, old);
+                let val = match phi.reg {
+                    Reg::Scc => Val::Bit(v),
+                    _ => Val::I32(v),
+                };
+                self.vals.insert(phi.value, val);
+            }
         }
+        Ok(())
+    }
+
+    fn guard(&mut self, b: usize, i: usize) -> Result<Option<V>, Why> {
+        let g = match self.x.st.guards[b][i] {
+            None => None,
+            Some(g) => Some(self.boolean(g, self.cur)?),
+        };
+        // In a region of a wave-wide branch the group runs together, a console wave that did
+        // not take the branch has no effect, whatever its EXEC (the region may set every lane).
+        let took = self
+            .wide_regions
+            .as_ref()
+            .and_then(|w| w.innermost.get(b).copied().flatten())
+            .and_then(|r| self.group_took.get(&r).copied());
+        Ok(match (g, took) {
+            (g, None) => g,
+            (None, Some(t)) => Some(t),
+            (Some(g), Some(t)) => Some(self.s.m.bin(self.cur, Bin::And, g, t)),
+        })
     }
 
     // ---- results ----

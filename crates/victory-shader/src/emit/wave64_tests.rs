@@ -1058,3 +1058,162 @@ fn single_lane_readfirstlane_lowers_inside_divergent_scalar_branch() {
     let lowered = out.expect("single-lane readfirstlane should lower cleanly without barrier");
     assert_eq!(lowered.wave_size, Some(32));
 }
+
+/// Fork pull request #1124's review (Dathinel): a console wave that does not enter a
+/// group-widened branch keeps its scalars. 128 threads, two console waves; `s7 = 5`, then the
+/// lanes with `t > s0` OR `1 << (t >> 1)` over their console wave into `s7` inside
+/// `if (any lane) { ... }` (`s_cbranch_scc0` on the SCC of `s_and_saveexec_b64`); after the
+/// join every thread stores its console wave's `s7` to its own word. A console wave with no lane
+/// past `s0` skips the body on the console, so its `s7` stays 5, though the other console wave
+/// of the group runs the body (thresholds 63..126). On a 32-lane host the group runs the body
+/// together (`group_any`), and the console wave that did not take it must not see the body's
+/// scalar writes.
+#[test]
+fn a_console_wave_that_skips_a_group_widened_branch_keeps_its_scalars() {
+    let mut words = vec![
+        0x3412_0082, // v_lshlrev_b32 v9, 2, v0: this thread's byte offset
+        0x7E0A_0281, // v_mov_b32 v5, 1
+        0x2C0C_0081, // v_lshrrev_b32 v6, 1, v0
+        0x340E_0B06, // v_lshlrev_b32 v7, v6, v5
+        0xBE87_0385, // s_mov_b32 s7, 5
+        0x7D82_0000, // v_cmp_lt_u32 vcc, s0, v0 (t > s0)
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF84_0014, // s_cbranch_scc0 +20: over the wave OR
+    ];
+    words.extend_from_slice(&super::wave::WAVE_OR_V7_TO_S7);
+    words.extend_from_slice(&[
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+        0x7E00_0207, // v_mov_b32 v0, s7
+        0x38 << 26 | 0x1C << 18 | 1 << 12,
+        0x80 << 24 | 2 << 16 | 9, // buffer_store_dword v0, v9, s[8:11], 0 offen
+    ]);
+    let native = native_of(&words, true, 128);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let br_block = p
+        .blocks
+        .iter()
+        .position(|b| b.insts.last().is_some_and(|i| i.name() == "s_cbranch_scc0"))
+        .expect("branch block");
+    let shader = match lowered(&native, &p, &HashSet::from([br_block])) {
+        Ok(s) => s,
+        Err(e) => {
+            // Refusing the program is safe (the title goes without it); only a wrong
+            // translation is a failure.
+            eprintln!("refused for 32-lane waves: {e}");
+            return;
+        }
+    };
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return;
+    };
+    let (root, pso) = match host.compute_pipeline(&shader) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("the hardware device does not take this program: {e}; not run");
+            return;
+        }
+    };
+    // The console: each console wave's s7, from its own lanes past s0.
+    let expect = |below: u32, wave: u32| -> u32 {
+        let lanes: Vec<u32> = (wave * 64..wave * 64 + 64).filter(|&t| t > below).collect();
+        if lanes.is_empty() { 5 } else { lanes.iter().fold(0, |acc, &t| acc | 1u32 << ((t >> 1) & 31)) }
+    };
+    let mut wrong = Vec::new();
+    for below in (0..=128u32).chain([200]) {
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(vec![below, 0, 0, 0]))],
+                    views: &[View::RawUav(128)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+        let bad = (0..128u32).filter(|&t| out[0][t as usize] != expect(below, t / 64)).count();
+        if bad > 0 {
+            let t = (0..128u32).find(|&t| out[0][t as usize] != expect(below, t / 64)).unwrap();
+            wrong.push(format!("s0 {below}: {bad} words wrong, first thread {t}: {:#x}, want {:#x}", out[0][t as usize], expect(below, t / 64)));
+        }
+    }
+    assert!(wrong.is_empty(), "{} thresholds wrong:\n{}", wrong.len(), wrong.join("\n"));
+}
+
+/// Fork pull request #1124's review (Dathinel's two-store regression): a console wave that
+/// does not enter a group-widened branch stores nothing inside it, even where the body sets
+/// EXEC to every lane, and every thread stores after the join. 128 threads; the body (entered
+/// by a console wave with a lane past `s0`) sets EXEC to all and stores 1 to the thread's word,
+/// and after the join every thread stores 2 to its word 128 on.
+#[test]
+fn a_console_wave_that_skips_a_group_widened_branch_stores_nothing_in_it() {
+    let words = [
+        0x3412_0082, // v_lshlrev_b32 v9, 2, v0
+        0x7D82_0000, // v_cmp_lt_u32 vcc, s0, v0 (t > s0)
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF84_0006, // s_cbranch_scc0 +6: over the body
+        0xBE8E_047E, // s_mov_b64 s[14:15], exec
+        0xBEFE_04C1, // s_mov_b64 exec, -1
+        0x7E14_0281, // v_mov_b32 v10, 1
+        0x38 << 26 | 0x1C << 18 | 1 << 12,
+        0x80 << 24 | 2 << 16 | 10 << 8 | 9, // buffer_store_dword v10, v9, s[8:11], 0 offen
+        0xBEFE_040E, // s_mov_b64 exec, s[14:15]
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]: the join
+        0x7E14_0282, // v_mov_b32 v10, 2
+        0x38 << 26 | 0x1C << 18 | 1 << 12 | 512,
+        0x80 << 24 | 2 << 16 | 10 << 8 | 9, // buffer_store_dword v10, v9, s[8:11], 512 offen
+    ];
+    let native = native_of(&words, true, 128);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let br_block = p
+        .blocks
+        .iter()
+        .position(|b| b.insts.last().is_some_and(|i| i.name() == "s_cbranch_scc0"))
+        .expect("branch block");
+    let shader = match lowered(&native, &p, &HashSet::from([br_block])) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("refused for 32-lane waves: {e}");
+            return;
+        }
+    };
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return;
+    };
+    let (root, pso) = match host.compute_pipeline(&shader) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("the hardware device does not take this program: {e}; not run");
+            return;
+        }
+    };
+    let entered = |below: u32, wave: u32| (wave * 64..wave * 64 + 64).any(|t| t > below);
+    let mut wrong = Vec::new();
+    for below in (0..=128u32).chain([200]) {
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(vec![below, 0, 0, 0]))],
+                    views: &[View::RawUav(256)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+        let want = |w: usize| -> u32 {
+            if w >= 128 { 2 } else { u32::from(entered(below, w as u32 / 64)) }
+        };
+        let bad: Vec<usize> = (0..256).filter(|&w| out[0][w] != want(w)).collect();
+        if let Some(&w) = bad.first() {
+            wrong.push(format!("s0 {below}: {} words wrong, first word {w}: {:#x}, want {:#x}", bad.len(), out[0][w], want(w)));
+        }
+    }
+    assert!(wrong.is_empty(), "{} thresholds wrong:\n{}", wrong.len(), wrong.join("\n"));
+}
