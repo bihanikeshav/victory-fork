@@ -2454,7 +2454,14 @@ impl<'a> Lower<'a> {
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
-            dxil: self.s.finish(),
+            dxil: {
+                if self.s.mesh.is_some() && std::env::var_os("VICTORY_MESH_WHY").is_some() {
+                    for e in &self.s.outputs {
+                        eprintln!("MESH-WHY   after {}{} cols={} written={:04b}", e.name, e.index, e.cols, e.usage);
+                    }
+                }
+                self.s.finish()
+            },
             user_data,
             samplers: self.samplers,
         })
@@ -4605,6 +4612,23 @@ impl<'a> Lower<'a> {
         let fits = |m: super::shader::Mesh| {
             mesh_output_bytes(outputs, prims, m.max_vertices, m.max_primitives) <= MESH_OUTPUT_LIMIT
         };
+        if !fits(mesh) && std::env::var_os("VICTORY_MESH_WHY").is_some() {
+            let cols = |els: &[super::container::SigElement]| els.iter().map(|e| u32::from(e.cols)).sum::<u32>();
+            let used = |els: &[super::container::SigElement]| els.iter().map(|e| e.usage.count_ones()).sum::<u32>();
+            eprintln!(
+                "MESH-WHY threads={threads} max v/p={}/{} vertex scalars {} ({} written) primitive scalars {} ({} written); {} bytes at the lane count",
+                mesh.max_vertices,
+                mesh.max_primitives,
+                cols(outputs),
+                used(outputs),
+                cols(prims),
+                used(prims),
+                mesh_output_bytes(outputs, prims, mesh.max_vertices.min(threads), mesh.max_primitives.min(threads))
+            );
+            for e in outputs.iter() {
+                eprintln!("MESH-WHY   out {}{} kind={} row={:?} col={} cols={} usage={:04b} interp={}", e.name, e.index, e.kind, e.row, e.col, e.cols, e.usage, e.interp);
+            }
+        }
         if !fits(mesh) {
             mesh.max_vertices = mesh.max_vertices.min(threads);
             mesh.max_primitives = mesh.max_primitives.min(threads);
