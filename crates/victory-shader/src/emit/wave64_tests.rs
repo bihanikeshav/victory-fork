@@ -1315,3 +1315,67 @@ fn console_waves_of_a_group_loop_different_counts_on_their_own_scalars() {
     }
     assert!(wrong.is_empty(), "{} threads wrong, first: {:?}", wrong.len(), wrong.first());
 }
+
+/// A per-lane loop whose back edge is taken wave-wide in a group of two console waves, with a
+/// lane read inside: the decision to go round again is the console wave's (both halves meet
+/// for it, at the loop's latch), so the loop's phis come from the block the meeting ends in.
+/// Lane `t` goes round `(t & 3) + 1` times, adding lane 40's thread index of its console wave.
+#[test]
+fn a_wave_wide_loop_in_a_group_of_two_console_waves_sums_its_lane_reads() {
+    let words = [
+        0x3606_0083, // v_and_b32 v3, 3, v0
+        0x7E02_0280, // v_mov_b32 v1, 0
+        0x7E04_0280, // v_mov_b32 v2, 0
+        0xBE8C_047E, // s_mov_b64 s[12:13], exec
+        // loop:
+        0x4A02_0281, // v_add_nc_u32 v1, 1, v1
+        0xD760_0011,
+        0x0001_5100, // v_readlane_b32 s17, v0, 40
+        0x4A04_0411, // v_add_nc_u32 v2, s17, v2
+        0x7D8C_0303, // v_cmp_ge_u32 vcc, v3, v1: another round
+        0x87FE_6A7E, // s_and_b64 exec, exec, vcc
+        0xBF89_FFF9, // s_cbranch_execnz loop
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+        0x3408_0082, // v_lshlrev_b32 v4, 2, v0
+        0x38 << 26 | 0x1C << 18 | 1 << 12,
+        0x80 << 24 | 2 << 16 | 2 << 8 | 4, // buffer_store_dword v2, v4, s[8:11], 0 offen
+    ];
+    let native = native_of(&words, true, 128);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let latch = p
+        .blocks
+        .iter()
+        .position(|b| b.insts.last().is_some_and(|i| i.name() == "s_cbranch_execnz"))
+        .expect("latch");
+    let shader = lowered(&native, &p, &HashSet::from([latch]))
+        .unwrap_or_else(|e| panic!("does not translate for 32-lane waves: {e}"));
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return;
+    };
+    let (root, pso) = host.compute_pipeline(&shader).unwrap_or_else(|e| panic!("refused: {e}"));
+    let out = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(vec![0; 4]))],
+                views: &[View::RawUav(128)],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+    let wrong: Vec<String> = (0..128u32)
+        .filter_map(|t| {
+            let want = ((t & 3) + 1) * (t / 64 * 64 + 40);
+            (out[0][t as usize] != want).then(|| format!("thread {t}: {}, want {want}", out[0][t as usize]))
+        })
+        .collect();
+    assert!(wrong.is_empty(), "{} threads wrong, first: {:?}", wrong.len(), wrong.first());
+}

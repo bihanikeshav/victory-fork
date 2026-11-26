@@ -1401,6 +1401,22 @@ impl<'a> Lower<'a> {
                                 lds_meet = None;
                             }
                         }
+                        // D3D12 gives a group 32 KiB of LDS: a program that leaves no room for the
+                        // dwords the halves meet through keeps 64-lane waves (refused on this host).
+                        if lds_ok {
+                            let pairs = if group > 64 && pair_sync_on() { group.div_ceil(64) } else { 0 };
+                            let exchanged = if crosses { 2 * group.div_ceil(64) } else { 0 };
+                            if s.lds_dwords + pairs + exchanged > 8192 {
+                                lds_ok = false;
+                                if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+                                    eprintln!(
+                                        "WAVE64-LDS-FULL {} of 8192 LDS dwords are the program's; the halves need {} more",
+                                        s.lds_dwords,
+                                        pairs + exchanged
+                                    );
+                                }
+                            }
+                        }
                         if lds_ok {
                             wave = 32;
                             split_lds = s.lds_dwords > 0 && group > 32;
@@ -1414,7 +1430,8 @@ impl<'a> Lower<'a> {
                                 // numbers go through two exchange dwords past the program's LDS
                                 exchange = Some((s.lds_dwords, group <= 32, all));
                                 s.lds_dwords += 2 * group.div_ceil(64);
-                                if multi_wide {
+                                // (with pair meetings no decision is the group's: no slots for it)
+                                if multi_wide && pair_slots.is_none() {
                                     let host_waves = group.div_ceil(32);
                                     group_wide = Some((s.lds_dwords, host_waves));
                                     s.lds_dwords += host_waves;
@@ -5325,6 +5342,12 @@ impl<'a> Lower<'a> {
         self.s.m.terminate(spin, Term::CondBr(out, after, spin));
         self.s.op(after, "barrier", Attr::NoDuplicate, void, 80, &[fence]);
         self.cur = after;
+        // (a block whose end is already taken as its IR block's way out - a wave-wide branch's
+        // decision is made after it - goes on in `after`: the joins' phis come from there)
+        let ir = self.cur_ir;
+        if self.tail.get(ir).copied().flatten() == Some(at) {
+            self.tail[ir] = Some(after);
+        }
         after
     }
 
