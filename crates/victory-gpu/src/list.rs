@@ -1069,6 +1069,21 @@ void main(uint3 id : SV_DispatchThreadID) {
     // SAFETY: as above.
     unsafe impl Sync for Pass {}
 
+    impl Pass {
+        fn dispatch(&self, list: &ID3D12GraphicsCommandList, src: &ID3D12Resource, dst: &ID3D12Resource, sizes: [u32; 7]) {
+            let [_, _, _, width, height, _, _] = sizes;
+            // SAFETY: an open list, our pass, and live buffers in SRV and UAV states respectively.
+            unsafe {
+                list.SetComputeRootSignature(&self.root);
+                list.SetPipelineState(&self.pso);
+                list.SetComputeRoot32BitConstants(0, sizes.len() as u32, sizes.as_ptr().cast(), 0);
+                list.SetComputeRootShaderResourceView(1, src.GetGPUVirtualAddress());
+                list.SetComputeRootUnorderedAccessView(2, dst.GetGPUVirtualAddress());
+                list.Dispatch(width.div_ceil(8), height.div_ceil(8), 1);
+            }
+        }
+    }
+
     /// The two buffers, kept while the sizes stay the same.
     struct Buffers {
         sizes: (u64, u64),
@@ -1201,16 +1216,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         // The stretch, buffer to buffer.
         barrier(l, &a, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         barrier(l, &b, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        let sizes = [sw, sh, sp / 8, dw, dh, dp / out_bytes, u32::from(out_format == RGB9E5)];
-        // SAFETY: an open list, our pass, live buffers the list keeps.
-        unsafe {
-            l.SetComputeRootSignature(&pass.root);
-            l.SetPipelineState(&pass.pso);
-            l.SetComputeRoot32BitConstants(0, sizes.len() as u32, sizes.as_ptr().cast(), 0);
-            l.SetComputeRootShaderResourceView(1, a.GetGPUVirtualAddress());
-            l.SetComputeRootUnorderedAccessView(2, b.GetGPUVirtualAddress());
-            l.Dispatch(dw.div_ceil(8), dh.div_ceil(8), 1);
-        }
+        pass.dispatch(l, &a, &b, [sw, sh, sp / 8, dw, dh, dp / out_bytes, u32::from(out_format == RGB9E5)]);
         list.keep(&pass.root);
         list.keep(&pass.pso);
         // The title's pipeline and root signature again at its next draw
@@ -1236,6 +1242,48 @@ void main(uint3 id : SV_DispatchThreadID) {
         barrier(l, &b, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
         Some(())
     }
+    #[test]
+    fn stretch_writes_pitched_half_and_rgb9e5_rows() {
+        let host = crate::host::host().expect("D3D12 test host");
+        let pass = pass().expect("stretch shader and pipeline");
+        let (src, mapped) = host.upload_buffer(512).unwrap();
+        // Two rows of two RGBA16F pixels. Adjacent rows ramp in opposite directions.
+        let black = [0u16, 0, 0, 0x3c00];
+        let color = [0x3c00u16, 0x3800, 0x3400, 0x3c00];
+        let quarter = [0x3400u16, 0x3000, 0x2c00, 0x3c00];
+        let three_quarters = [0x3a00u16, 0x3600, 0x3200, 0x3c00];
+        // SAFETY: the upload is mapped for 512 bytes, with a 256-byte row pitch.
+        unsafe {
+            for (offset, pixel) in [(0, black), (8, color), (256, color), (264, black)] {
+                mapped.add(offset).cast::<[u16; 4]>().write(pixel);
+            }
+        }
+        for packed in [false, true] {
+            let pixel_bytes = if packed { 4 } else { 8 };
+            let row_bytes = 4 * pixel_bytes;
+            let dst = host.uav_buffer(512).unwrap();
+            let back = host.read_back_buffer(512).unwrap();
+            let list = host.new_list().unwrap();
+            barrier(&list.list, &dst, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            pass.dispatch(&list.list, &src, &dst, [2, 2, 32, 4, 2, 256 / pixel_bytes as u32, u32::from(packed)]);
+            barrier(&list.list, &dst, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            // SAFETY: both buffers are 512 bytes and in copy-compatible states.
+            unsafe { list.list.CopyBufferRegion(&back, 0, &dst, 0, 512) };
+            let mut actual = vec![0xcc; 2 * row_bytes];
+            list.defer_read_back(back, actual.as_mut_ptr(), [row_bytes, 2, row_bytes]);
+            list.close();
+            host.execute(&[&list]);
+            let expected: Vec<u8> = if packed {
+                // Quarter intensity has exponent 14, three quarters has 15 and full intensity has 16.
+                [0, 0x71010100, 0x79818180, 0x81010100, 0x81010100, 0x79818180, 0x71010100, 0u32]
+                    .into_iter().flat_map(u32::to_le_bytes).collect()
+            } else {
+                [black, quarter, three_quarters, color, color, three_quarters, quarter, black].into_iter().flatten().flat_map(u16::to_le_bytes).collect()
+            };
+            assert_eq!(actual, expected, "packed={packed}");
+        }
+    }
+
 }
 
 /// Texture to texture on the GPU; buffer to texture through an upload
