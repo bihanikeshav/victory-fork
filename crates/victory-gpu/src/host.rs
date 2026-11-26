@@ -3811,6 +3811,10 @@ mod fill_ahead {
             Ok("1") => 1,
             Ok("never") => 2,
             Ok("alt") => 3,
+            Ok(other) if !other.trim().is_empty() && other.trim() != "0" => {
+                crate::watch::unknown_value("VICTORY_FILL_WAIT", other);
+                0
+            }
             _ => 0,
         })
     }
@@ -9123,6 +9127,10 @@ fn refresh_once() -> bool {
     match *MODE.get_or_init(|| match std::env::var("VICTORY_REFRESH_ONCE").as_deref() {
         Ok("1") => 1,
         Ok("alt") => 2,
+        Ok(other) if !other.trim().is_empty() && other.trim() != "0" => {
+            crate::watch::unknown_value("VICTORY_REFRESH_ONCE", other);
+            0
+        }
         _ => 0,
     }) {
         0 => false,
@@ -9531,6 +9539,10 @@ fn fills_plain() -> bool {
     match *MODE.get_or_init(|| match std::env::var("VICTORY_FILLS_PLAIN").as_deref() {
         Ok("1") => 1,
         Ok("alt") => 2,
+        Ok(other) if !other.trim().is_empty() && other.trim() != "0" => {
+            crate::watch::unknown_value("VICTORY_FILLS_PLAIN", other);
+            0
+        }
         _ => 0,
     }) {
         0 => false,

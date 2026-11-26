@@ -445,12 +445,23 @@ pub(crate) fn dirty4k() -> bool {
     }
 }
 
+
+/// A switch set to a value it does not take: said once, loudly, and the switch is off (a run
+/// that meant `alt` and wrote `2` measured nothing and said nothing).
+pub(crate) fn unknown_value(name: &str, value: &str) {
+    tracing::warn!("{name}={value} is not a value it takes (see its comment): it is off");
+}
+
 /// `VICTORY_DIRTY_4K`: 0 off, 1 on, 2 in turn.
 fn dirty4k_mode() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| match std::env::var("VICTORY_DIRTY_4K").as_deref() {
         Ok("1") => 1,
         Ok("alt") => 2,
+        Ok(other) if !other.trim().is_empty() && other.trim() != "0" => {
+            crate::watch::unknown_value("VICTORY_DIRTY_4K", other);
+            0
+        }
         _ => 0,
     })
 }
@@ -813,6 +824,10 @@ fn view_known() -> bool {
     match *MODE.get_or_init(|| match std::env::var("VICTORY_VIEW_KNOWN").as_deref() {
         Ok("1") => 1,
         Ok("alt") => 2,
+        Ok(other) if !other.trim().is_empty() && other.trim() != "0" => {
+            crate::watch::unknown_value("VICTORY_VIEW_KNOWN", other);
+            0
+        }
         _ => 0,
     }) {
         0 => false,
@@ -858,6 +873,10 @@ fn light_mode() -> u8 {
     *MODE.get_or_init(|| match std::env::var("VICTORY_LIGHT_REFRESH").as_deref() {
         Ok("1") => 1,
         Ok("alt") => 2,
+        Ok(other) if !other.trim().is_empty() && other.trim() != "0" => {
+            crate::watch::unknown_value("VICTORY_LIGHT_REFRESH", other);
+            0
+        }
         _ => 0,
     })
 }
@@ -1329,6 +1348,10 @@ fn absent_mode() -> u8 {
     *MODE.get_or_init(|| match std::env::var("VICTORY_ABSENT_ONCE").as_deref() {
         Ok("1") => 1,
         Ok("alt") => 2,
+        Ok(other) if !other.trim().is_empty() && other.trim() != "0" => {
+            crate::watch::unknown_value("VICTORY_ABSENT_ONCE", other);
+            0
+        }
         _ => 0,
     })
 }
