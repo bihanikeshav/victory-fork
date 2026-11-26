@@ -3663,7 +3663,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                         // buffer of its own, four a frame, 43 to 60 ms a
                         // frame) and neither side had other bytes after
                         // one. A copy INTO such a range still waits.
-                        if !touches(written, dst, dst + len) && fill_ahead::on() {
+                        if !touches(written, dst, dst + len) && fill_ahead::on(src, len) {
                             if count {
                                 fill_ahead::read(src, len);
                             }
@@ -3681,7 +3681,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                     if touches(written, src, src + len) {
                         // Not waited for, and checked when the flights land
                         // (`fill_ahead`).
-                        if fill_ahead::on() {
+                        if fill_ahead::on(src, len) {
                             if count {
                                 fill_ahead::read(src, len);
                             }
@@ -3747,7 +3747,32 @@ mod fill_ahead {
     const KEEP: u64 = 16;
 
     /// A flight changed bytes a fill had read ahead of it: fills wait.
+    /// With `VICTORY_FILL_WAIT_PIECES` (the default), only fills and copies
+    /// that read the 64 KiB pieces where that was seen wait ([`WAITING`]);
+    /// `VICTORY_FILL_WAIT_PIECES=0`: every fill waits from then on, as before.
     static WAIT: AtomicBool = AtomicBool::new(false);
+    /// The pieces where a flight changed bytes a fill had read ahead of it.
+    static WAITING: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
+    /// Some piece waits (a lock-free look before [`WAITING`]'s).
+    static ANY_WAITING: AtomicBool = AtomicBool::new(false);
+
+    fn by_pieces() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var("VICTORY_FILL_WAIT_PIECES").map_or(true, |v| v.trim() != "0"))
+    }
+
+    /// Whether `src..src + len` must wait for the flights: the run's latch,
+    /// or (by pieces) a piece of it where reading ahead was seen to miss.
+    fn waits(src: usize, len: usize) -> bool {
+        if !by_pieces() {
+            return WAIT.load(Relaxed);
+        }
+        if len == 0 || !ANY_WAITING.load(Relaxed) {
+            return false;
+        }
+        let set = WAITING.lock().unwrap_or_else(|e| e.into_inner());
+        set.as_ref().is_some_and(|w| (src / PIECE..=(src + len - 1) / PIECE).any(|p| w.contains(&p)))
+    }
     /// Since the last frame line: fills that read ahead; landings' writes
     /// that touched one's piece. Since the start: fills that read bytes a
     /// flight then changed.
@@ -3776,9 +3801,38 @@ mod fill_ahead {
 
     static READ: Mutex<Option<HashMap<usize, Piece>>> = Mutex::new(None);
 
-    pub(super) fn on() -> bool {
-        static ON: OnceLock<bool> = OnceLock::new();
-        *ON.get_or_init(|| std::env::var_os("VICTORY_FILL_WAIT").is_none_or(|v| v != "1")) && !WAIT.load(Relaxed)
+    /// `VICTORY_FILL_WAIT`: unset, read ahead until a flight is seen to change bytes a fill
+    /// read (then wait); `1` wait from the start; `never` read ahead for good, even after such a
+    /// flight (a measurement: what the waits cost; a fill or copy may then take bytes a frame
+    /// old); `alt` twenty seconds as `never`, twenty as unset, in turn.
+    fn mode() -> u8 {
+        static MODE: OnceLock<u8> = OnceLock::new();
+        *MODE.get_or_init(|| match std::env::var("VICTORY_FILL_WAIT").as_deref() {
+            Ok("1") => 1,
+            Ok("never") => 2,
+            Ok("alt") => 3,
+            _ => 0,
+        })
+    }
+
+    pub(super) fn on(src: usize, len: usize) -> bool {
+        match mode() {
+            1 => false,
+            2 => true,
+            3 => {
+                static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
+                let never = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+                static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+                if LAST.swap(u8::from(never), Relaxed) != u8::from(never) {
+                    tracing::info!(
+                        "fills and copies of title memory read ahead of flights from now (VICTORY_FILL_WAIT=alt): {}",
+                        if never { "ON, never waiting" } else { "off, as usual" }
+                    );
+                }
+                never || !waits(src, len)
+            }
+            _ => !waits(src, len),
+        }
     }
 
     /// A fill reads `len` bytes at `src` ahead of flights that may write
@@ -3804,7 +3858,7 @@ mod fill_ahead {
     /// A landing is about to put `new` into title memory at `at`: bytes
     /// shaders wrote, merged into the title's.
     pub(crate) fn wrote(at: usize, new: &[u8]) {
-        if new.is_empty() || WAIT.load(Relaxed) {
+        if new.is_empty() || (!by_pieces() && WAIT.load(Relaxed)) {
             return;
         }
         let frame = crate::frame::current();
@@ -3836,6 +3890,24 @@ mod fill_ahead {
             }
             let n = COUNT[2].fetch_add(1, Relaxed) + 1;
             let first = now.iter().zip(&new[a - at..b - at]).position(|(x, y)| x != y).unwrap_or(0);
+            if by_pieces() {
+                let mut set = WAITING.lock().unwrap_or_else(|e| e.into_inner());
+                let set = set.get_or_insert_with(Default::default);
+                let mut new_pieces = 0;
+                for piece in from / PIECE..=(to - 1) / PIECE {
+                    new_pieces += usize::from(set.insert(piece));
+                }
+                ANY_WAITING.store(true, Relaxed);
+                if new_pieces > 0 {
+                    tracing::warn!(
+                        "a fill of upload memory read {} bytes at {from:#x} in frame {read_in} ahead of a flight whose shaders                          changed them (first at {:#x}, landed in frame {frame}): fills and copies that read its 64 KiB piece                          wait for flights from here on ({} pieces wait; {n} such fills; VICTORY_FILL_WAIT_PIECES=0: all wait)",
+                        to - from,
+                        a + first,
+                        set.len()
+                    );
+                }
+                continue;
+            }
             if !WAIT.swap(true, Relaxed) {
                 tracing::warn!(
                     "a fill of upload memory read {} bytes at {from:#x} in frame {read_in} ahead of a flight whose shaders changed \
