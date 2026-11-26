@@ -1009,9 +1009,14 @@ fn the_elected_lane_sets_its_flag_once_wherever_it_is() {
 }
 
 #[test]
-fn multi_wave_widen_rejects_divergent_scalar_branch() {
-    // Divergent scalar branch (`s_bcnt1` on `vcc` -> `s_cbranch_scc0`) enclosing a widened `s_cbranch_execz`
+fn multi_wave_widen_runs_inside_a_divergent_scalar_branch() {
+    // Divergent scalar branch (`s_bcnt1` on `vcc` -> `s_cbranch_scc0`) enclosing a widened
+    // `s_cbranch_execz`: the console waves of the group go different ways at the scalar branch
+    // (s0 is then the count of lanes past s0 in this console wave). With pair meetings each
+    // console wave takes the wave-wide branch for itself. Each stores its wave OR to its word.
     let mut words = vec![
+        0x2C12_0086, // v_lshrrev_b32 v9, 6, v0: the console wave
+        0x3412_1282, // v_lshlrev_b32 v9, 2, v9: its word
         0x7D82_0000, // v_cmp_lt_u32 vcc, s0, v0 (differs between wave 0 and wave 1 for s0=63)
         0xBE80_106A, // s_bcnt1_i32_b64 s0, vcc
         0xBF84_001D, // s_cbranch_scc0 label_end (+29)
@@ -1025,8 +1030,8 @@ fn multi_wave_widen_rejects_divergent_scalar_branch() {
     words.extend_from_slice(&super::wave::WAVE_OR_V7_TO_S7);
     words.extend_from_slice(&[
         0x7E00_0207, // v_mov_b32 v0, s7
-        0x38 << 26 | 0x1C << 18,
-        0x80 << 24 | 2 << 16,
+        0x38 << 26 | 0x1C << 18 | 1 << 12,
+        0x80 << 24 | 2 << 16 | 9, // buffer_store_dword v0, v9, s[8:11], 0 offen
         0xBEFE_040C, // s_mov_b64 exec, s[12:13]
     ]);
     let native = native_of(&words, true, 128);
@@ -1036,14 +1041,47 @@ fn multi_wave_widen_rejects_divergent_scalar_branch() {
         .iter()
         .position(|b| b.insts.last().is_some_and(|i| i.name() == "s_cbranch_execz"))
         .expect("branch block");
-    let err = match lowered(&native, &p, &HashSet::from([br_block])) {
-        Ok(_) => panic!("must refuse wave-wide branch inside divergent scalar branch"),
-        Err(e) => e,
+    let shader = lowered(&native, &p, &HashSet::from([br_block]))
+        .unwrap_or_else(|e| panic!("does not translate for 32-lane waves: {e}"));
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return;
     };
-    assert!(matches!(
-        err,
-        ShaderError::Unsupported { what, .. } if what.contains("divergent scalar branch")
-    ));
+    let (root, pso) = host.compute_pipeline(&shader).unwrap_or_else(|e| panic!("refused: {e}"));
+    // the console: per console wave, the count of its lanes past s0, then the OR over its
+    // lanes past that count (nothing stored when either is empty)
+    let expect = |below: u32, w: u32| -> u32 {
+        let lanes = w * 64..w * 64 + 64;
+        let count = lanes.clone().filter(|&t| t > below).count() as u32;
+        if count == 0 {
+            return 0;
+        }
+        lanes.filter(|&t| t > count).fold(0, |acc, t| acc | 1u32 << ((t >> 1) & 31))
+    };
+    let mut wrong = Vec::new();
+    for below in (0..=128u32).chain([200]) {
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(vec![below, 0, 0, 0]))],
+                    views: &[View::RawUav(2)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+        for w in 0..2u32 {
+            if out[0][w as usize] != expect(below, w) {
+                wrong.push(format!("s0 {below}, wave {w}: {:#x}, want {:#x}", out[0][w as usize], expect(below, w)));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{} wrong:
+{}", wrong.len(), wrong.join("
+"));
 }
 
 #[test]
@@ -1318,4 +1356,64 @@ fn a_console_wave_that_skips_a_group_widened_branch_stores_nothing_in_it() {
         }
     }
     assert!(wrong.is_empty(), "{} thresholds wrong:\n{}", wrong.len(), wrong.join("\n"));
+}
+
+/// Console waves of one group that loop different counts on a scalar of their own (as
+/// `vfx_triangleClip:CS_DefragHeap_ComputeRelocations` and `CS_CollectTriangles_Meshlets` do,
+/// on `v_readfirstlane` / `v_readlane` values), with a lane read inside the loop that needs both
+/// halves of the console wave. 128 threads; console wave `w` loops `w + 1` times, adding lane
+/// 40's thread index each time; every thread stores (iterations, sum).
+#[test]
+fn console_waves_of_a_group_loop_different_counts_on_their_own_scalars() {
+    let words = [
+        0x7E0C_0500, // v_readfirstlane_b32 s6, v0
+        0x9006_8606, // s_lshr_b32 s6, s6, 6: the console wave
+        0x8006_8106, // s_add_u32 s6, s6, 1: its count
+        0xBE87_0380, // s_mov_b32 s7, 0
+        0xBE90_0380, // s_mov_b32 s16, 0
+        // loop:
+        0x8007_8107, // s_add_u32 s7, s7, 1
+        0xD760_0011,
+        0x0001_5100, // v_readlane_b32 s17, v0, 40
+        0x8010_1110, // s_add_u32 s16, s16, s17
+        0xBF0A_0607, // s_cmp_lt_u32 s7, s6
+        0xBF85_FFFA, // s_cbranch_scc1 loop
+        0x3402_0083, // v_lshlrev_b32 v1, 3, v0
+        0x7E04_0207, // v_mov_b32 v2, s7
+        0x7E06_0210, // v_mov_b32 v3, s16
+        0x38 << 26 | 0x1D << 18 | 1 << 12,
+        0x80 << 24 | 2 << 16 | 2 << 8 | 1, // buffer_store_dwordx2 v[2:3], v1, s[8:11], 0 offen
+    ];
+    let native = native_of(&words, true, 128);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let shader = lowered(&native, &p, &HashSet::new())
+        .unwrap_or_else(|e| panic!("does not translate for 32-lane waves: {e}"));
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return;
+    };
+    let (root, pso) = host.compute_pipeline(&shader).unwrap_or_else(|e| panic!("refused: {e}"));
+    let out = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(vec![0; 4]))],
+                views: &[View::RawUav(256)],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+    let mut wrong = Vec::new();
+    for t in 0..128u32 {
+        let w = t / 64;
+        let want = (w + 1, (w + 1) * (w * 64 + 40));
+        let got = (out[0][2 * t as usize], out[0][2 * t as usize + 1]);
+        if got != want {
+            wrong.push(format!("thread {t}: {got:?}, want {want:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{} threads wrong, first: {:?}", wrong.len(), wrong.first());
 }
