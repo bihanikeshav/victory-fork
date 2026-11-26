@@ -1363,6 +1363,26 @@ impl<'a> Lower<'a> {
                                 })
                             });
                             if !safe_lds {
+                                // (the blocks with LDS accesses the group does not run together:
+                                // `widen` takes the branches around them wave-wide)
+                                let ag = ag.as_ref();
+                                let mut named = Vec::new();
+                                for (b, blk) in p.blocks.iter().enumerate() {
+                                    let needs_sync = blk.insts.iter().any(lds)
+                                        || lds_meet.as_ref().is_some_and(|m| m.1.get(b).is_some_and(|&(a, e)| a || e));
+                                    if needs_sync && !ag.is_some_and(|ag| ag.get(b).copied().unwrap_or(false)) {
+                                        need(b);
+                                        named.push(blk.offset);
+                                    }
+                                }
+                                if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+                                    eprintln!(
+                                        "WAVE64-GROUP LDS where the group does not run together ({} blocks, all-group known: {}): {:x?}",
+                                        named.len(),
+                                        ag.is_some(),
+                                        &named[..named.len().min(12)]
+                                    );
+                                }
                                 lds_ok = false;
                                 lds_meet = None;
                             }
