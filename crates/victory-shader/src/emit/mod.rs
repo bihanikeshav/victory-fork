@@ -190,6 +190,16 @@ pub fn shader_opt() -> u32 {
     *PASSES.get_or_init(|| parse_shader_opt(std::env::var("VICTORY_SHADER_OPT").ok().as_deref()))
 }
 
+/// With `VICTORY_NAN_SCRUB=1` (off by default), pixel colour exports and float
+/// image stores replace NaN and +/-infinity with `0.0` so bad values do not
+/// spread into black or blown-out patches across bloom, blur, or temporal passes.
+/// (Upstream Marvisak/VIctory pull request 3397, adapted from
+/// trustno1-coder/VIctory-NVIDIA.)
+pub fn nan_scrub() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_NAN_SCRUB").is_some_and(|v| v == "1"))
+}
+
 /// Everything a translation depends on besides the container: the
 /// translator's own source (hashed at build time), the value of every
 /// `VICTORY_*` switch it reads, the host facts the device hands it (widest
@@ -215,6 +225,7 @@ pub fn translation_fingerprint() -> Vec<u8> {
     out.push(group_sync());
     out.extend_from_slice(&shader_opt().to_le_bytes());
     out.push(u8::from(wave_pairs_on()));
+    out.push(u8::from(nan_scrub()));
     out
 }
 

@@ -11014,6 +11014,9 @@ impl<'a> Lower<'a> {
                     self.float_of(v)?
                 });
             }
+            for v in &mut vals {
+                *v = self.scrub_nan(*v);
+            }
             let h = self.handle(site, src, false, props)?;
             let at = self.begin_guarded(guard);
             let mut args = vec![h];
@@ -12127,6 +12130,26 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
+    /// Replaces NaN and +/-infinity with `0.0` when `VICTORY_NAN_SCRUB=1`
+    /// (`super::nan_scrub()`), preventing one bad float from spreading across
+    /// bloom, blur, or temporal upscaling passes.
+    fn scrub_nan(&mut self, f: V) -> V {
+        self.scrub_nan_if(f, super::nan_scrub())
+    }
+
+    fn scrub_nan_if(&mut self, f: V, enabled: bool) -> V {
+        if !enabled {
+            return f;
+        }
+        // |f| >= +inf (unordered) catches both NaN and +/-infinity.
+        let c = self.cur;
+        let a = self.unary(6, f);
+        let inf = self.s.m.f32(0x7f80_0000);
+        let bad = self.s.m.cmp(c, pred::UGE, a, inf);
+        let zero = self.s.m.f32(0);
+        self.s.m.select(c, bad, zero, f)
+    }
+
     fn export(&mut self, b: usize, i: usize) -> Result<(), Why> {
         let e = *self
             .exports
@@ -12330,13 +12353,18 @@ impl<'a> Lower<'a> {
             let el = &mut elements(self, primitive)[id];
             el.usage |= 1 << col;
             let (suffix, x) = match el.comp {
-                9 if half.is_some() => (".f32", self.as_float(x)),
+                9 if half.is_some() => {
+                    let f = self.as_float(x);
+                    let colour = self.s.pixel && matches!(e.target, Target::Color(_));
+                    (".f32", if colour { self.scrub_nan(f) } else { f })
+                }
                 9 => {
                     let f = match self.floats.get(&value) {
                         Some(&f) => f,
                         None => self.as_float(x),
                     };
-                    (".f32", f)
+                    let colour = self.s.pixel && matches!(e.target, Target::Color(_));
+                    (".f32", if colour { self.scrub_nan(f) } else { f })
                 }
                 _ => (".i32", x),
             };
