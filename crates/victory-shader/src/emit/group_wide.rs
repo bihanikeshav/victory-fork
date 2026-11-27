@@ -115,12 +115,14 @@ pub(super) fn wide_regions(st: &Structured) -> Option<WideRegions> {
 }
 
 /// Every per-lane branch (by its block) with its region: the blocks reachable from it that do
-/// not post-dominate it, which only some lanes run. Not the branches the wave takes together
-/// ([`Structured::wide`]), nor those on scalar conditions. None with an indirect exit.
-pub(super) fn lane_regions(st: &Structured) -> Option<Vec<(usize, Vec<bool>)>> {
+/// not post-dominate it and the natural loops it leaves, which only some lanes run. Not the
+/// branches the wave takes together ([`Structured::wide`]), nor those on scalar conditions.
+/// None with an indirect exit.
+pub(super) fn lane_regions(st: &Structured, loop_exits: bool) -> Option<Vec<(usize, Vec<bool>)>> {
     let n = st.exits.len();
     let succ = exits_succ(st)?;
     let pdom = postdominators(&succ);
+    let loops = if loop_exits { natural_loops(&succ) } else { Vec::new() };
     let mut regions = Vec::new();
     for (d, e) in st.exits.iter().enumerate() {
         let LaneExit::Branch { when, .. } = *e else { continue };
@@ -129,6 +131,13 @@ pub(super) fn lane_regions(st: &Structured) -> Option<Vec<(usize, Vec<bool>)>> {
         }
         let mut seen = vec![false; n];
         mark_branch_region(&succ, &pdom, d, &mut seen);
+        // A per-lane exit leaves only some lanes to revisit its loop, even
+        // when the exiting block post-dominates itself. Adapted from fork PR #993.
+        for body in loops.iter().filter(|body| body[d] && succ[d].iter().any(|&s| !body[s])) {
+            for (divergent, &member) in seen.iter_mut().zip(body) {
+                *divergent |= member;
+            }
+        }
         regions.push((d, seen));
     }
     Some(regions)
