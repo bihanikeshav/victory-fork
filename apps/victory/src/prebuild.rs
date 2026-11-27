@@ -207,6 +207,14 @@ pub fn run(paths: &[PathBuf], threads: usize) -> Result<()> {
     let mut todo = todo.into_inner().unwrap_or_else(|e| e.into_inner());
     let early = todo.iter().filter(|(later, _)| !later).count();
     todo.sort_by_key(|&(later, _)| later);
+    // `VICTORY_PREBUILD_EARLY_ONLY=1`: make only what an earlier run drew
+    // with (the run's early list) and leave the rest of the pack to the runs
+    // that reach it. After a translator change a whole pack is hours of
+    // driver compiles; a test route needs a tenth of it.
+    if std::env::var_os("VICTORY_PREBUILD_EARLY_ONLY").is_some_and(|v| v == "1") {
+        eprintln!("pipelines    {} of the pack left to the runs (VICTORY_PREBUILD_EARLY_ONLY=1)", todo.len() - early);
+        todo.truncate(early);
+    }
     let todo: Vec<Job> = todo.into_iter().map(|(_, job)| job).collect();
     eprintln!(
         "pipelines    {} to make or load ({early} of them drawn with in an earlier run, first), {listed} pre-built already",
