@@ -1544,10 +1544,28 @@ fn pooled(n: usize) -> Vec<u8> {
     v
 }
 
+/// Default snapshot memory kept for reuse (128 MiB; was 512 MiB), overridable
+/// with `VICTORY_SHADOW_POOL_MB` (Marvisak/VIctory#3442).
+const DEFAULT_POOL_BYTES: usize = 128 << 20;
+
+/// [`pool_bytes`] for a `VICTORY_SHADOW_POOL_MB` value (unset or not a number:
+/// the default).
+fn pool_bytes_for(val: Option<&str>) -> usize {
+    val.and_then(|v| v.trim().parse::<usize>().ok())
+        .map(|mb| mb.saturating_mul(1 << 20))
+        .unwrap_or(DEFAULT_POOL_BYTES)
+}
+
+/// Bytes of idle snapshot buffers kept past the largest one.
+fn pool_bytes() -> usize {
+    static LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| pool_bytes_for(std::env::var("VICTORY_SHADOW_POOL_MB").ok().as_deref()))
+}
+
 /// Returns a snapshot buffer to the pool: at most 8 kept, the largest, and
-/// of those the largest one and the next ones up to `KEPT` bytes in all.
+/// of those the largest one and the next ones up to [`pool_bytes`] in all.
 fn give_back(v: Vec<u8>) {
-    const KEPT: usize = 512 << 20;
+    let kept = pool_bytes();
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     pool.push(v);
     pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
@@ -1556,7 +1574,7 @@ fn give_back(v: Vec<u8>) {
     pool.retain(|v| {
         seen += 1;
         total = total.saturating_add(v.capacity());
-        seen == 1 || total <= KEPT
+        seen == 1 || total <= kept
     });
 }
 
@@ -1602,6 +1620,22 @@ fn last_difference(a: &[u8], b: &[u8]) -> Option<usize> {
         .zip(&b_chunks[chunk])
         .rposition(|(x, y)| x != y)
         .map(|i| chunk * DIFF_CHUNK + i)
+}
+
+#[cfg(test)]
+mod pool_tests {
+    use super::{DEFAULT_POOL_BYTES, pool_bytes_for};
+
+    /// `VICTORY_SHADOW_POOL_MB` sets the cap in MiB; unset or junk keeps 128 MiB.
+    #[test]
+    fn pool_cap_defaults_and_respects_env() {
+        assert_eq!(DEFAULT_POOL_BYTES, 128 << 20);
+        assert_eq!(pool_bytes_for(None), DEFAULT_POOL_BYTES);
+        assert_eq!(pool_bytes_for(Some("64")), 64 << 20);
+        assert_eq!(pool_bytes_for(Some(" 512 ")), 512 << 20);
+        assert_eq!(pool_bytes_for(Some("0")), 0);
+        assert_eq!(pool_bytes_for(Some("junk")), DEFAULT_POOL_BYTES);
+    }
 }
 
 #[cfg(test)]
